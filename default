@@ -15,6 +15,21 @@
 #
 ######################################################################
 #
+#	ESU16 eduroam template - Google Workspace Secure LDAP, EAP-TTLS/PAP
+#
+#	This OUTER server only assigns VLANs to ROAMING users (requests
+#	proxied to eduroam / another home server).  Local school users
+#	get their VLAN in the "inner-tunnel" server, because only the
+#	inner tunnel knows the real user name.
+#
+#	Works with any access point vendor (UniFi, Aruba Instant On,
+#	etc.) - roaming users are matched on any RADIUS client.
+#
+#	BEFORE USE: check the VLAN numbers in the DYNAMIC VLAN
+#	ASSIGNMENT section of post-auth.
+#
+######################################################################
+#
 #	Read "man radiusd" before editing this file.  See the section
 #	titled DEBUGGING.  It outlines a method where you can quickly
 #	obtain the configuration you want, without running into
@@ -307,7 +322,7 @@ authorize {
 	#  attributes in the request, and turning them into attributes
 	#  which are more standard.
 	#
-	#  It takes care of processing the 'raddb/mods-config/preprocess/hints' 
+	#  It takes care of processing the 'raddb/mods-config/preprocess/hints'
 	#  and the 'raddb/mods-config/preprocess/huntgroups' files.
 	preprocess
 
@@ -355,7 +370,7 @@ authorize {
 	#  here means that it will fix the Calling-Station-Id attribute to
 	#  the normal format as specified in RFC 3580 Section 3.21.
 	#
-	#  If you are using WiMAX 2.1 (LTE) then un-commenting will allow 
+	#  If you are using WiMAX 2.1 (LTE) then un-commenting will allow
 	#  the module to handle SQN resyncronisation. Prior to calling the
 	#  module it is necessary to populate the following attributes
 	#  with the relevant keys:
@@ -435,7 +450,18 @@ authorize {
 
 	#
 	#  The ldap module reads passwords from the LDAP database.
+	#
+	#  Google Workspace: for plain (non-EAP) PAP requests, e.g.
+	#  radtest, look the user up and authenticate by binding to
+	#  Google as that user.  Only if the user was found AND sent a
+	#  password.  (EAP-TTLS logins are handled in inner-tunnel.)
+	#
 	-ldap
+	if ((ok || updated) && &User-Password) {
+		update control {
+			&Auth-Type := ldap
+		}
+	}
 
 	#
 	#  Enforce daily limits on time spent logged in.
@@ -457,11 +483,7 @@ authorize {
 	#  get a chance to set Auth-Type for themselves.
 	#
 	pap
-        if (User-Password) {
-            update control {
-                   Auth-Type := ldap
-            }
-        }
+
 	#
 	#  If "status_server = yes", then Status-Server messages are passed
 	#  through the following section, and ONLY the following section.
@@ -523,7 +545,7 @@ authenticate {
 	#  in the 'authorize' section supplies a password.  The
 	#  password can be clear-text, or encrypted.
 	Auth-Type PAP {
-		ldap
+		pap
 	}
 
 	#
@@ -556,16 +578,10 @@ authenticate {
 	#  Pluggable Authentication Modules.
 #	pam
 
-	#  Uncomment it if you want to use ldap for authentication
 	#
-	#  Note that this means "check plain-text password against
-	#  the ldap database", which means that EAP won't work,
-	#  as it does not supply a plain-text password.
-	#
-	#  We do NOT recommend using this.  LDAP servers are databases.
-	#  They are NOT authentication servers.  FreeRADIUS is an
-	#  authentication server, and knows what to do with authentication.
-	#  LDAP servers do not.
+	#  Google Workspace Secure LDAP: verify the password by binding
+	#  to ldap.google.com as the user.  Selected by the
+	#  'Auth-Type := ldap' set in authorize above.
 	#
 	Auth-Type LDAP {
 		ldap
@@ -788,6 +804,69 @@ post-auth {
 #
 #	}
 
+	######################################################################
+	#  DYNAMIC VLAN ASSIGNMENT (roaming / proxied users only)
+	#
+	#  Local school users are assigned a VLAN in "inner-tunnel"
+	#  post-auth (the outer request only has "anonymous@realm", so
+	#  LDAP-Group checks here would never match).
+	#
+	#  This block only handles users whose request was PROXIED to
+	#  eduroam or another home server.  ":=" overrides any VLAN the
+	#  remote home server may have sent back.
+	#
+	#  VLANs:   1 = Staff  (ESU16 staff roaming in)
+	#          16 = Guest  (all other eduroam visitors)
+	######################################################################
+
+	# FIRST SITE
+	if (&control:Proxy-To-Realm) {
+		update reply {
+			&Tunnel-Type := VLAN
+			&Tunnel-Medium-Type := IEEE-802
+		}
+		# ESU16 users -> Staff VLAN
+		if (&request:User-Name =~ /@esusixteen\.org$/i) {
+			update reply {
+				&Tunnel-Private-Group-ID := "1"
+			}
+		}
+		# All other eduroam visitors -> Guest VLAN
+		else {
+			update reply {
+				&Tunnel-Private-Group-ID := "16"
+			}
+		}
+	}
+	# END OF FIRST SITE
+
+	# SECOND SITE (optional - only if one server serves two sites
+	# that use DIFFERENT VLAN numbers.  Add a shortname check to the
+	# FIRST SITE "if" above, e.g.
+	#   if (&request:Client-Shortname == "site1" && &control:Proxy-To-Realm) {
+	# then uncomment below and set this site's shortname.)
+#	elsif (&request:Client-Shortname == "site2" && &control:Proxy-To-Realm) {
+#		update reply {
+#			&Tunnel-Type := VLAN
+#			&Tunnel-Medium-Type := IEEE-802
+#		}
+#		if (&request:User-Name =~ /@esusixteen\.org$/i) {
+#			update reply {
+#				&Tunnel-Private-Group-ID := "102"
+#			}
+#		}
+#		else {
+#			update reply {
+#				&Tunnel-Private-Group-ID := "104"
+#			}
+#		}
+#	}
+	# END OF SECOND SITE
+
+	######################################################################
+	#  END OF DYNAMIC VLAN ASSIGNMENT
+	######################################################################
+
 	#
 	#  For EAP-TTLS and PEAP, add the cached attributes to the reply.
 	#  The "session-state" attributes are automatically cached when
@@ -800,74 +879,10 @@ post-auth {
 	#  If both session-state and reply contain a User-Name attribute, remove
 	#  the one in the reply if it is just a copy of the one in the request, so
 	#  we don't end up with two User-Name attributes.
-
-# DYNAMIC VLAN ASSIGNMENT
-# FIRST SITE
-if (request:Client-Shortname == "lan") {
-        update reply {
-                Tunnel-Type := VLAN
-                Tunnel-Medium-Type := IEEE-802
-        }
-# Put @esusixteen.org users into Staff VLAN
-        if (suffix == "esusixteen.org") {
-                update reply {
-                        Tunnel-Private-Group-ID = 102
-                }
-        }
-# Put non-local users into Guest VLAN
-        if (&control:Proxy-To-Realm) {
-                update reply {
-                        Tunnel-Private-Group-ID = 104
-                }
-        }
-# Put users in student Group into Student VLAN
-        if (LDAP-Group == "cn=students,ou=Groups,dc=,dc=org") {
-                update reply {
-                        Tunnel-Private-Group-ID = 103
-                }
-        }
-# Put users in staff Group into Staff VLAN
-        if (LDAP-Group == "cn=staff,ou=Groups,dc=,dc=org") {
-                update reply {
-                        Tunnel-Private-Group-ID = 102
-                }
-        }
-}
-# END OF FIRST SITE
-# SECOND SITE
-#elsif (request:Client-Shortname == "second-site") {
-#        update reply {
-#                Tunnel-Type := VLAN
-#                Tunnel-Medium-Type := IEEE-802
-#        }
-# Put @esu11.org users into Staff VLAN
-#        if (suffix == "esu11.org") {
-#                update reply {
-#                        Tunnel-Private-Group-ID = 102
-#                }
-#        }
-# Put non-local users into Guest VLAN
-#        if (&control:Proxy-To-Realm) {
-#                update reply {
-#                        Tunnel-Private-Group-ID = 104
-#                }
-#        }
-# Put users in student Group into Student VLAN
-#        if (LDAP-Group == "cn=students,ou=Groups,dc=,dc=org") {
-#                update reply {
-#                        Tunnel-Private-Group-ID = 103
-#                }
-#        }
-# Put users in staff Group into Staff VLAN
-#        if (LDAP-Group == "cn=staff,ou=Groups,dc=,dc=org") {
-#                update reply {
-#                        Tunnel-Private-Group-ID = 102
-#                }
-#        }
-#}
-# END OF SECOND SITE
-# END OF DYNAMIC VLAN ASSIGNMENT
-
+	#
+	#  (This is also what copies the VLAN set in inner-tunnel into
+	#  the final Access-Accept for local users.)
+	#
 	if (session-state:User-Name && reply:User-Name && request:User-Name && (reply:User-Name == request:User-Name)) {
 		update reply {
 			&User-Name !* ANY

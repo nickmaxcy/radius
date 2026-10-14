@@ -6,6 +6,24 @@
 #
 #	$Id$
 #
+#	ESU16 eduroam template - Google Workspace Secure LDAP, EAP-TTLS/PAP
+#
+#	BEFORE USE: replace SCHOOLDOMAIN with the school's Google domain
+#	name (without .org), e.g. paxtonschools:
+#
+#	  sudo sed -i 's/SCHOOLDOMAIN/paxtonschools/g' \
+#	      /etc/freeradius/3.0/sites-available/inner-tunnel
+#
+#	If the school's domain is NOT .org, also change dc=org
+#	(e.g. dc=net), or for multi-part domains such as
+#	school.k12.ne.us use dc=school,dc=k12,dc=ne,dc=us
+#
+#	Then check the OU names and VLAN IDs in the DYNAMIC VLAN
+#	ASSIGNMENT section of post-auth match the school's Google Admin.
+#
+#	(Editing with nano instead: Ctrl+\ = search & replace,
+#	 enter SCHOOLDOMAIN, then the school's name, then A for All.)
+#
 ######################################################################
 
 server inner-tunnel {
@@ -29,6 +47,10 @@ server inner-tunnel {
 #
 #  Do NOT do any PEAP tests.  It won't help.  Instead, concentrate
 #  on fixing the inner tunnel configuration.  DO NOTHING ELSE.
+#
+#  NOTE (Google Workspace): PEAP / MS-CHAP will NOT work, because
+#  Google does not expose NT password hashes.  Test with plain
+#  radtest (PAP) only.
 #
 listen {
        ipaddr = 127.0.0.1
@@ -59,7 +81,10 @@ authorize {
 	#  Do checks on outer / inner User-Name, so that users
 	#  can't spoof us by using incompatible identities
 	#
-#	filter_inner_identity
+	#  ENABLED (eduroam best practice): the realm of the outer
+	#  anonymous identity must match the realm of the inner identity.
+	#
+	filter_inner_identity
 
 	#
 	#  The chap module will set 'Auth-Type := CHAP' if we are
@@ -90,7 +115,7 @@ authorize {
 
 	#
 	#  Look for realms in user@domain format
-	# 
+	#
 	#  Note that proxying the inner tunnel authentication means
 	#  that the user MAY use one identity in the outer session
 	#  (e.g. "anonymous", and a different one here
@@ -151,7 +176,18 @@ authorize {
 
 	#
 	#  The ldap module reads passwords from the LDAP database.
+	#
+	#  Google Workspace: look the user up in Secure LDAP.  Only if
+	#  the user was found AND sent a password, authenticate by
+	#  binding to Google as that user.  Unknown users fall through
+	#  and are rejected without a bind attempt.
+	#
 	-ldap
+	if ((ok || updated) && &User-Password) {
+		update control {
+			&Auth-Type := ldap
+		}
+	}
 
 	#
 	#  Enforce daily limits on time spent logged in.
@@ -172,11 +208,6 @@ authorize {
 	#  get a chance to set Auth-Type for themselves.
 	#
 	pap
-                if (User-Password) {
-            update control {
-                   Auth-Type := ldap
-            }
-        }
 }
 
 
@@ -205,7 +236,7 @@ authenticate {
 	#  in the 'authorize' section supplies a password.  The
 	#  password can be clear-text, or encrypted.
 	Auth-Type PAP {
-		ldap
+		pap
 	}
 
 	#
@@ -232,16 +263,10 @@ authenticate {
 	#  Pluggable Authentication Modules.
 #	pam
 
-	# Uncomment it if you want to use ldap for authentication
 	#
-	# Note that this means "check plain-text password against
-	# the ldap database", which means that EAP won't work,
-	# as it does not supply a plain-text password.
-	#
-	#  We do NOT recommend using this.  LDAP servers are databases.
-	#  They are NOT authentication servers.  FreeRADIUS is an
-	#  authentication server, and knows what to do with authentication.
-	#  LDAP servers do not.
+	#  Google Workspace Secure LDAP: verify the password by binding
+	#  to ldap.google.com as the user.  Selected by the
+	#  'Auth-Type := ldap' set in authorize above.
 	#
 	Auth-Type LDAP {
 		ldap
@@ -294,6 +319,7 @@ post-auth {
 	#
 	#  If you want the Access-Accept to contain the inner
 	#  User-Name, uncomment the following lines.
+	#  (Shows the real user instead of "anonymous" in UniFi.)
 	#
 #	update outer.session-state {
 #	       User-Name := &User-Name
@@ -318,6 +344,68 @@ post-auth {
 	#
 #	ldap
 
+	######################################################################
+	#  DYNAMIC VLAN ASSIGNMENT (local school users) - by Google OU
+	#
+	#  Runs here because only the inner tunnel knows the real user
+	#  (the outer request is "anonymous@realm").
+	#
+	#  Google Secure LDAP includes the user's OU path in their DN:
+	#    uid=jdoe,ou=IT,ou=Staff,ou=Users,dc=SCHOOLDOMAIN,dc=org
+	#  ("ou=Users" is Google's container; "Staff" is the top-level OU.)
+	#  The regex matches the top-level OU and EVERY OU nested under it.
+	#
+	#  First match wins.  Values are written to outer.session-state;
+	#  the outer "default" server copies session-state into the
+	#  final Access-Accept.
+	#
+	#  EDIT FOR EACH SCHOOL:
+	#    - SCHOOLDOMAIN (and dc=org if the domain isn't .org)
+	#    - OU names (Staff / Students) to match Google Admin
+	#    - VLAN IDs
+	#
+	#  VLANs:   1 = Staff     (anyone in the Staff OU tree)
+	#          20 = Students  (anyone in the Students OU tree)
+	#          16 = Guest     (authenticated, but in neither OU)
+	######################################################################
+
+	# ---- Staff OU (and all OUs under it) -> Staff VLAN ----
+	if (&control:LDAP-UserDn =~ /ou=Staff,ou=Users,dc=SCHOOLDOMAIN,dc=org$/i) {
+		update outer.session-state {
+			&Tunnel-Private-Group-ID := "1"
+		}
+	}
+	# ---- Students OU (and all OUs under it) -> Student VLAN ----
+	elsif (&control:LDAP-UserDn =~ /ou=Students,ou=Users,dc=SCHOOLDOMAIN,dc=org$/i) {
+		update outer.session-state {
+			&Tunnel-Private-Group-ID := "20"
+		}
+	}
+	# ---- Anyone else at the school -> Guest VLAN ----
+	else {
+		update outer.session-state {
+			&Tunnel-Private-Group-ID := "16"
+		}
+	}
+
+	update outer.session-state {
+		&Tunnel-Type := VLAN
+		&Tunnel-Medium-Type := IEEE-802
+	}
+
+	#
+	#  OPTIONAL - to send a specific sub-OU to its own VLAN, add an
+	#  "if" ABOVE the Staff rule (more specific rules go first), e.g.
+	#
+	#    if (&control:LDAP-UserDn =~ /ou=Admin,ou=Staff,ou=Users,dc=SCHOOLDOMAIN,dc=org$/i) {
+	#        update outer.session-state { &Tunnel-Private-Group-ID := "30" }
+	#    }
+	#    elsif ... (then change the Staff "if" below it to "elsif")
+	#
+	######################################################################
+	#  END DYNAMIC VLAN ASSIGNMENT
+	######################################################################
+
 
 	#
 	#  Un-comment the following if you want to generate Moonshot (ABFAB) TargetedIds
@@ -337,6 +425,9 @@ post-auth {
 	#
 	#  Instead of "use_tunneled_reply", change this "if (0)" to an
 	#  "if (1)".
+	#
+	#  Left at "if (0)": the VLAN attributes above are written
+	#  directly to outer.session-state.
 	#
 	if (0) {
 		#
